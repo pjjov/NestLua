@@ -18,7 +18,7 @@ bytes on the wire. This keeps NestLua portable across any Lua HTTP stack
 (OpenResty/nginx, love2d sockets, luasocket, a custom C binding, etc).
 
 ```lua
-local nest = require "nestlua.core"
+local nest = require "nestlua"
 ```
 
 ## Request / response shape
@@ -44,7 +44,7 @@ local nest = require "nestlua.core"
 ## Building an API
 
 ```lua
-local nest = require "nestlua.core"
+local nest = require "nestlua"
 
 local module     = nest.module("api")
 local controller = module:controller("Users")
@@ -117,11 +117,11 @@ handler's first parameter, and so on.
 ## HTTP exceptions
 
 Call one of these on the required module itself (not on `ctx` — the module
-returned by `require "nestlua.core"`) from inside a guard, interceptor,
+returned by `require "nestlua"`) from inside a guard, interceptor,
 pipe, or handler to abort the request with that status code:
 
 ```lua
-local nest = require "nestlua.core"
+local nest = require "nestlua"
 
 controller:route("Example")
   :get("/example")
