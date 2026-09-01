@@ -157,6 +157,102 @@ local function find_header(headers, name)
 end
 
 --============================================================--
+-- HTTP exceptions
+--
+-- Mirrors Nest's built-in HttpException subclasses. Call one of these as
+-- a method on the required module (`nest:not_found_error()`) from inside
+-- a guard, interceptor, pipe, or route handler to abort the request with
+-- that status code; the raised value is caught centrally by
+-- Module:_dispatch and turned into the equivalent HTTP response (subject
+-- to any exception filters registered with module/controller/route
+-- :filter(), see below).
+--============================================================--
+
+local HTTP_STATUS_TEXT = {
+  [400] = "Bad Request",
+  [401] = "Unauthorized",
+  [403] = "Forbidden",
+  [404] = "Not Found",
+  [405] = "Method Not Allowed",
+  [406] = "Not Acceptable",
+  [408] = "Request Timeout",
+  [409] = "Conflict",
+  [410] = "Gone",
+  [412] = "Precondition Failed",
+  [413] = "Payload Too Large",
+  [415] = "Unsupported Media Type",
+  [418] = "I'm a teapot",
+  [422] = "Unprocessable Entity",
+  [500] = "Internal Server Error",
+  [501] = "Not Implemented",
+  [502] = "Bad Gateway",
+  [503] = "Service Unavailable",
+  [504] = "Gateway Timeout",
+  [505] = "HTTP Version Not Supported",
+}
+
+local HttpExceptionMeta = {
+  __tostring = function(e) return "HttpException(" .. tostring(e.code) .. "): " .. tostring(e.body) end,
+}
+
+-- Builds (but does not throw) an HttpException-shaped value. `message` may
+-- be a string, a table (for a structured error body), or nil to fall back
+-- to the standard status text. Useful for exception filters that want to
+-- construct/re-throw a specific exception, or for advanced use where you
+-- want the object without immediately aborting execution.
+function nest.http_exception(code, message)
+  assert(type(code) == "number" and code >= 100 and code <= 599,
+    "http_exception: code must be a valid HTTP status code")
+  assert(message == nil or type(message) == "string" or type(message) == "table",
+    "http_exception: message must be a string, a table, or nil")
+  local body = message
+  if body == nil then
+    body = HTTP_STATUS_TEXT[code] or ("HTTP " .. tostring(code))
+  end
+  return setmetatable({ __class = "HttpException", code = code, body = body }, HttpExceptionMeta)
+end
+
+function nest.is_http_exception(obj) return is_instance(obj, "HttpException") end
+
+-- name -> status code for every one-liner exception helper below.
+local HTTP_EXCEPTIONS = {
+  { name = "bad_request_error",                code = 400 },
+  { name = "unauthorized_error",               code = 401 },
+  { name = "forbidden_error",                  code = 403 },
+  { name = "not_found_error",                  code = 404 },
+  { name = "method_not_allowed_error",         code = 405 },
+  { name = "not_acceptable_error",             code = 406 },
+  { name = "request_timeout_error",            code = 408 },
+  { name = "conflict_error",                   code = 409 },
+  { name = "gone_error",                       code = 410 },
+  { name = "precondition_failed_error",        code = 412 },
+  { name = "payload_too_large_error",          code = 413 },
+  { name = "unsupported_media_type_error",     code = 415 },
+  { name = "im_a_teapot_error",                code = 418 },
+  { name = "unprocessable_entity_error",       code = 422 },
+  { name = "internal_server_error",            code = 500 },
+  { name = "not_implemented_error",            code = 501 },
+  { name = "bad_gateway_error",                code = 502 },
+  { name = "service_unavailable_error",        code = 503 },
+  { name = "gateway_timeout_error",            code = 504 },
+  { name = "http_version_not_supported_error", code = 505 },
+}
+
+for _, def in ipairs(HTTP_EXCEPTIONS) do
+  -- Defined so it's callable as `nest:name(message)`; `self` is unused but
+  -- required to make the colon-call convention shown in the docs work.
+  nest[def.name] = function(_, message)
+    error(nest.http_exception(def.code, message))
+  end
+end
+
+-- nest:http_error(code, message) - escape hatch for any status code not
+-- covered by the named helpers above (mirrors Nest's base HttpException).
+function nest:http_error(code, message)
+  error(nest.http_exception(code, message))
+end
+
+--============================================================--
 -- Forward declarations
 --============================================================--
 
@@ -208,6 +304,7 @@ new_route_builder = function(module_ref, controller_ref, name)
   self.endpoints = {} -- { {method="GET", path="/users/:id"}, ... }
   self.guards = {}
   self.interceptors = {}
+  self.filters = {}
   self.params = {} -- ordered handler-argument descriptors
   self.handler = nil
   self.built = false
@@ -245,6 +342,23 @@ function RouteBuilderMethods:intercept(...)
   for _, i in ipairs(interceptors) do
     assert(type(i) == "function", "interceptor must be a function")
     self.interceptors[#self.interceptors + 1] = i
+  end
+  return self
+end
+
+-- Exception filters: function(exception, ctx) -> response table | nil.
+-- Return a response table ({code=, headers=, body=}, any field optional)
+-- to handle the exception; return nil (or throw) to defer to the next,
+-- less specific filter, or to the built-in default handling if none
+-- handle it. Tried route -> controller (leaf to root) -> module, i.e.
+-- the most specific filter gets first refusal.
+function RouteBuilderMethods:filter(...)
+  assert(nest.is_route(self), "self must be a RouteBuilder")
+  local filters = { ... }
+  assert(#filters > 0, "route:filter(...) requires at least one filter function")
+  for _, f in ipairs(filters) do
+    assert(type(f) == "function", "filter must be a function")
+    self.filters[#self.filters + 1] = f
   end
   return self
 end
@@ -318,6 +432,7 @@ function RouteBuilderMethods:describe()
     params = params,
     guard_count = #self.guards,
     interceptor_count = #self.interceptors,
+    filter_count = #self.filters,
   }
 end
 
@@ -346,6 +461,7 @@ new_controller = function(module_ref, name, parent)
   self.routes = {}
   self.guards = {}
   self.interceptors = {}
+  self.filters = {}
   return self
 end
 
@@ -396,6 +512,17 @@ function ControllerMethods:intercept(...)
   return self
 end
 
+function ControllerMethods:filter(...)
+  assert(nest.is_controller(self), "self must be a Controller")
+  local filters = { ... }
+  assert(#filters > 0, "controller:filter(...) requires at least one filter function")
+  for _, f in ipairs(filters) do
+    assert(type(f) == "function", "filter must be a function")
+    self.filters[#self.filters + 1] = f
+  end
+  return self
+end
+
 function ControllerMethods:full_prefix()
   local parts = {}
   local node = self
@@ -418,6 +545,7 @@ function ControllerMethods:describe()
     prefix = self:full_prefix(),
     guard_count = #self.guards,
     interceptor_count = #self.interceptors,
+    filter_count = #self.filters,
     routes = routes,
     controllers = subs,
   }
@@ -436,18 +564,12 @@ local function apply_pipe(pipe, value, ctx, kind, name)
   if not pipe then return value end
   local ok, result = pcall(pipe, value, ctx)
   if not ok then
-    error({
-      __nest_error = true,
-      code = 400,
-      message = "Pipe failed for " .. kind .. (name and (" '" .. name .. "'") or "") .. ": " .. tostring(result),
-    })
+    error(nest.http_exception(400,
+      "Pipe failed for " .. kind .. (name and (" '" .. name .. "'") or "") .. ": " .. tostring(result)))
   end
   if result == false then
-    error({
-      __nest_error = true,
-      code = 400,
-      message = "Validation failed for " .. kind .. (name and (" '" .. name .. "'") or ""),
-    })
+    error(nest.http_exception(400,
+      "Validation failed for " .. kind .. (name and (" '" .. name .. "'") or "")))
   elseif result == nil or result == true then
     return value
   else
@@ -525,6 +647,22 @@ function nest.compose_interceptors(...)
   end
 end
 
+-- Publicly exposed helper: fold several exception filters into one
+-- callback that tries each in order and returns the first response.
+function nest.compose_filters(...)
+  local filters = { ... }
+  for _, f in ipairs(filters) do
+    assert(type(f) == "function", "compose_filters: every filter must be a function")
+  end
+  return function(exception, ctx)
+    for _, f in ipairs(filters) do
+      local response = f(exception, ctx)
+      if response then return response end
+    end
+    return nil
+  end
+end
+
 local function compose_interceptor_chain(interceptors, final)
   local handler = final
   for i = #interceptors, 1, -1 do
@@ -552,6 +690,7 @@ function nest.module(name)
   self.controllers = {}
   self.guards = {}
   self.interceptors = {}
+  self.filters = {}
   self.decorators = {}
   self._built = false
   self._routes_flat = nil
@@ -594,6 +733,17 @@ function Module:intercept(...)
   for _, i in ipairs(interceptors) do
     assert(type(i) == "function", "interceptor must be a function")
     self.interceptors[#self.interceptors + 1] = i
+  end
+  return self
+end
+
+function Module:filter(...)
+  assert(nest.is_module(self), "self must be a Module")
+  local filters = { ... }
+  assert(#filters > 0, "module:filter(...) requires at least one filter function")
+  for _, f in ipairs(filters) do
+    assert(type(f) == "function", "filter must be a function")
+    self.filters[#self.filters + 1] = f
   end
   return self
 end
@@ -652,6 +802,7 @@ function Module:describe()
     name = self.name,
     guard_count = #self.guards,
     interceptor_count = #self.interceptors,
+    filter_count = #self.filters,
     controllers = controllers,
   }
 end
@@ -688,6 +839,67 @@ local function collect_interceptors(mod, entry)
   return interceptors
 end
 
+local function collect_filters(mod, entry)
+  -- Ordered outer -> inner (module, then controllers root to leaf, then
+  -- route); Module:_handle_exception walks this in reverse so the most
+  -- specific (route) filter gets first refusal, like Nest's filter scoping.
+  local filters = {}
+  for _, f in ipairs(mod.filters) do filters[#filters + 1] = f end
+  local chain = {}
+  local node = entry.controller
+  while node do
+    table.insert(chain, 1, node)
+    node = node.parent
+  end
+  for _, c in ipairs(chain) do
+    for _, f in ipairs(c.filters) do filters[#filters + 1] = f end
+  end
+  for _, f in ipairs(entry.route.filters) do filters[#filters + 1] = f end
+  return filters
+end
+
+-- Normalizes anything caught from the guard/interceptor/pipe/handler
+-- pipeline into an HttpException-shaped value: HttpExceptions raised via
+-- nest:xxx_error()/nest.http_exception() pass through unchanged; anything
+-- else (a plain string error, a Lua runtime error from a bug, ...) is
+-- wrapped as a 500 with the original error kept as `.cause` for filters
+-- that want to inspect it.
+local function normalize_exception(err)
+  if nest.is_http_exception(err) then return err end
+  return setmetatable({
+    __class = "HttpException",
+    code = 500,
+    body = "Internal Server Error: " .. tostring(err),
+    cause = err,
+  }, HttpExceptionMeta)
+end
+
+-- Runs registered exception filters (route -> controller chain -> module,
+-- most specific first) against a caught exception. The first filter that
+-- returns a response table wins; a filter that errors or returns
+-- nil/false is skipped in favor of the next, less specific one. If no
+-- filter handles it, falls back to a default response built from the
+-- exception's code/body.
+function Module:_handle_exception(entry, err, ctx)
+  local exception = normalize_exception(err)
+  local filters = collect_filters(self, entry)
+  for i = #filters, 1, -1 do
+    local ok, response = pcall(filters[i], exception, ctx)
+    if ok and type(response) == "table" then
+      response.code = response.code or exception.code
+      response.headers = response.headers or {}
+      if response.body == nil then response.body = exception.body end
+      return response
+    end
+  end
+  -- Default handling. Reuses ctx.res (rather than a fresh table) so
+  -- anything a pipe/handler/interceptor already wrote onto it (e.g. a
+  -- structured validation-error body) survives.
+  ctx.res.code = exception.code
+  if ctx.res.body == nil then ctx.res.body = exception.body end
+  return ctx.res
+end
+
 function Module:_dispatch(entry, req, params, query)
   local res = { code = 200, headers = {}, body = nil }
   local ctx = {
@@ -700,41 +912,36 @@ function Module:_dispatch(entry, req, params, query)
     route = entry.route,
   }
 
-  for _, guard in ipairs(collect_guards(self, entry)) do
-    local ok, allowed, reason = pcall(guard, ctx)
-    if not ok then
-      return { code = 500, headers = {}, body = "Guard error: " .. tostring(allowed) }
-    end
-    if not allowed then
-      return { code = 403, headers = {}, body = reason or "Forbidden" }
-    end
-  end
-
-  local final = function(context)
-    local ok, args_or_err = pcall(resolve_args, entry.route, context)
-    if not ok then
-      local e = args_or_err
-      if type(e) == "table" and e.__nest_error then
-        return { code = e.code, headers = {}, body = e.message }
+  -- Guards, pipes, interceptors and the handler all run inside a single
+  -- pcall so any of them can raise an HttpException (via nest:xxx_error())
+  -- or hit a genuine bug, and either way it's caught centrally and routed
+  -- through Module:_handle_exception exactly the same way.
+  local function run()
+    for _, guard in ipairs(collect_guards(self, entry)) do
+      local allowed, reason = guard(ctx)
+      if not allowed then
+        error(nest.http_exception(403, reason))
       end
-      return { code = 400, headers = {}, body = "Bad Request: " .. tostring(e) }
     end
-    local ok2, result = pcall(entry.route.handler, unpack(args_or_err))
-    if not ok2 then
-      return { code = 500, headers = {}, body = "Handler error: " .. tostring(result) }
+
+    local final = function(context)
+      local args = resolve_args(entry.route, context)
+      local result = entry.route.handler(unpack(args))
+      if result ~= nil then
+        context.res.body = result
+      end
+      return context.res
     end
-    if result ~= nil then
-      context.res.body = result
-    end
-    return context.res
+
+    local composed = compose_interceptor_chain(collect_interceptors(self, entry), final)
+    return composed(ctx)
   end
 
-  local composed = compose_interceptor_chain(collect_interceptors(self, entry), final)
-  local ok, result = pcall(composed, ctx)
-  if not ok then
-    return { code = 500, headers = {}, body = "Interceptor error: " .. tostring(result) }
+  local ok, result = pcall(run)
+  if ok then
+    return result or res
   end
-  return result or res
+  return self:_handle_exception(entry, result, ctx)
 end
 
 -- Handles one HTTP-ish request table and returns a response table.
