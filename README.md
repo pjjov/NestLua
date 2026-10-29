@@ -10,360 +10,374 @@
 
 # NestLua
 
-A NestJS-inspired routing/composition framework for Lua. NestLua does **not**
-open sockets or speak HTTP itself — it expects a separate adapter layer to
-turn real network traffic into a plain `request` table, call
-`module:handle(request)`, and turn the returned `response` table back into
-bytes on the wire. This keeps NestLua portable across any Lua HTTP stack
-(OpenResty/nginx, love2d sockets, luasocket, a custom C binding, etc).
+A NestJS-inspired framework for Lua: modules with dependency injection,
+controllers, routes, middleware, guards, interceptors, pipes, exception
+filters, a class-validator-style validator and OpenAPI generation.
+
+The core does **not** open sockets or speak HTTP itself. An adapter turns
+network traffic into a plain `request` table, calls `module:handle(request)`
+and turns the returned `response` table back into bytes on the wire. One
+ships with NestLua ([libmicrohttpd via lua-mhd](#http-server-lua-mhd)), and
+writing one for another stack (OpenResty, lua-http, luasocket, ...) is a few
+lines.
+
+Runs on Lua 5.1–5.5 and LuaJIT, with no dependencies.
 
 ```lua
 local nest = require "nestlua"
 ```
 
+| Module | Purpose |
+|---|---|
+| `nestlua` | modules, DI, routing, middleware, guards, interceptors, pipes, exceptions |
+| `nestlua.scheme` | validation / DTO schemas |
+| `nestlua.middleware` | body parser (JSON, urlencoded, multipart), CORS, request ids, access log |
+| `nestlua.openapi` | OpenAPI 3.1 document generation |
+| `nestlua.json` | JSON encoder / decoder |
+| `nestlua.mhd` | HTTP server adapter for [lua-mhd](https://github.com/pjjov/lua-mhd) |
+
+## Quick start
+
+```lua
+-- app.lua
+local nest = require "nestlua"
+local scheme = require "nestlua.scheme"
+local pipes = nest.pipes
+
+local CreateUserDto = scheme {
+  username = scheme.string:trim():range(3, 32):alphanumeric(),
+  email    = scheme.string:email(),
+}:strip()
+
+local users = nest.module("users")
+users:provide("users_repository", function() return require("my.repo").new() end)
+
+local controller = users:controller("Users"):use_prefix("/users")
+
+controller:route("GetUser")
+  :get("/:id(%d+)")
+  :use_param("id", pipes.int)
+  :use_inject("users_repository")
+  :handle(function(id, repo)
+    return repo:find(id) or nest:not_found_error()
+  end)
+
+controller:route("CreateUser")
+  :post("/")
+  :status(201)
+  :use_body(nil, CreateUserDto)     -- a schema is a pipe
+  :use_inject("users_repository")
+  :handle(function(dto, repo) return repo:create(dto) end)
+
+local app = nest.module("app"):use_prefix("/api"):import(users)
+return app
+```
+
+```lua
+-- server.lua
+local srv = require("nestlua.mhd").listen({ port = 8080 }, "app")
+io.read("l")
+srv:stop()
+```
+
+A complete example lives in [`examples/`](examples/) (`lua examples/server.lua`).
+
 ## Request / response shape
 
 ```lua
--- request (built by your adapter, read by NestLua)
+-- request (built by the adapter, read by NestLua)
 {
   method  = "GET",
   url     = "/users/42?sort=asc",
   version = "HTTP/1.1",
   headers = { ["Content-Type"] = "text/plain" },
-  body    = "...",              -- whatever your adapter decoded (string/table/etc)
+  query   = { sort = "asc" },   -- optional: used if the adapter already parsed it
+  body    = "...",              -- string, or whatever the adapter decoded
 }
 
--- response (built by NestLua, read by your adapter)
+-- response (built by NestLua, read by the adapter)
 {
   code    = 200,
   headers = { ["Content-Type"] = "application/json" },
   body    = { ... },
+  file    = "/path",            -- optional, see nest.file()
+  stream  = function() ... end, -- optional, see nest.stream()
 }
 ```
 
-## Building an API
-
-```lua
-local nest = require "nestlua"
-
-local module     = nest.module("api")
-local controller = module:controller("Users")
-
-controller:use_prefix("/users")
-
-controller:route("GetUsers")
-  :get("/")
-  :guard(AuthGuard)
-  :intercept(LoggingInterceptor)
-  :use_query("sort", sortValidator)
-  :use_query("pageIndex")
-  :use_query("pageLimit")
-  :handle(function(sort, pageIndex, pageLimit)
-    return { sort = sort, pageIndex = pageIndex, pageLimit = pageLimit }
-  end)
-
-local app = module:build()      -- compiles/validates the route tree
-local res = module:handle(req)  -- dispatch a single request (auto-builds if needed)
-```
-
-## Core API
-
-### Module
+## Modules
 
 | Call | Description |
 |---|---|
-| `nest.module(name)` | Creates a new `Module`. |
-| `module:controller(name)` | Creates and registers a top-level `Controller`. |
-| `module:decorator(name, fn)` | Registers `fn` so it becomes callable as `controller:name(...)` / `route:name(...)` for controllers/routes belonging to this module. |
-| `module:guard(...)` | Adds one or more guard functions, applied to every route in the module. |
-| `module:intercept(...)` | Adds one or more interceptors, applied to every route in the module. |
-| `module:build()` | Compiles path patterns, validates that every route was finished with `:handle()`, and returns an opaque `app` handle (useful for adapters that want a single object to hold on to). Idempotent; safe to call again after adding more routes. |
-| `module:handle(req)` | Dispatches a single request table, returns a response table. Calls `build()` automatically the first time if you haven't. |
-| `module:describe()` | Returns a plain-table description of the whole module tree (name, prefixes, route methods/paths, param descriptors, guard/interceptor counts) — meant for logging or a future Swagger generator. |
+| `nest.module(name)` | Creates a `Module`. |
+| `module:controller(name)` | Creates a top-level `Controller`. |
+| `module:use_prefix(prefix)` | Global path prefix for every route in the module (e.g. `"/api"`). |
+| `module:versioning(prefix)` | Prefix in front of version numbers (default `"v"` → `/v1/...`). |
+| `module:import(other, ...)` | Serves the other module's routes here and makes its exported providers injectable. The imported module's prefix, guards, interceptors, filters and middleware still apply to its own routes, nested inside this module's. |
+| `module:provide(name, factory)` | Registers a provider. `factory(module)` runs lazily, once (a singleton per module); it can resolve dependencies with `module:get(...)`. |
+| `module:provide_value(name, value)` | Registers an existing value as a provider. |
+| `module:export(name_or_module, ...)` | Makes providers, or a whole imported module's exports, visible to importers. |
+| `module:get(name)` | Resolves a provider visible from this module (own, or exported by an import). Circular dependencies raise an error. |
+| `module:use(fn, ...)` / `module:use_first(fn, ...)` | Registers [middleware](#middleware) (appended / prepended). |
+| `module:guard(...)` / `module:intercept(...)` / `module:filter(...)` | Guards, interceptors and exception filters for every route in the module. |
+| `module:meta(key, value)` | Default [metadata](#metadata) for every route. |
+| `module:decorator(name, fn)` | Registers `fn` as `controller:name(...)` / `route:name(...)` (see [custom decorators](#custom-decorators)). |
+| `module:on_init(fn)` / `module:on_shutdown(fn)` | Lifecycle hooks. Init runs once at the first build (imported modules first); shutdown runs on `module:shutdown()` (importer first). |
+| `module:shutdown()` | Runs shutdown hooks, and `on_shutdown` on provider instances that define it. |
+| `module:logger(fn \| false)` | `fn(level, message, err, traceback, ctx)`. Defaults to stderr; `false` silences it. |
+| `module:expose_errors(true)` | Includes Lua error messages in 500 bodies. **Development only.** |
+| `module:build()` | Compiles the route table. Optional: `handle()` rebuilds automatically whenever routes, guards etc. changed since the last build. Returns an `app` handle. |
+| `module:handle(req)` | Dispatches one request table, returns a response table. |
+| `module:routes()` | Every endpoint in match order (full path, method, route description). |
+| `module:describe()` | Plain-table description of the module tree. |
 
-### Controller
+Provider instances that define `on_init(self, module)` or `on_shutdown(self, module)` methods get them called on creation and on `module:shutdown()`.
+
+## Controllers
 
 | Call | Description |
 |---|---|
-| `controller:route(name)` | Returns a new `RouteBuilder` registered on this controller. |
-| `controller:controller(name)` | Creates a **sub-controller** that inherits the parent's prefix, guards and interceptors (concatenated/appended). |
-| `controller:use_prefix(prefix)` | Sets this controller's path-prefix segment (combined with ancestors' prefixes and each route's own path). |
-| `controller:guard(...)` | Adds guards applied to every route under this controller (and its sub-controllers). |
-| `controller:intercept(...)` | Adds interceptors applied to every route under this controller (and its sub-controllers). |
-| `controller:describe()` | Introspection, see above. |
-| `controller:<custom decorator>(...)` | Any decorator registered via `module:decorator` on the owning module. |
+| `controller:route(name)` | Returns a new `RouteBuilder`. |
+| `controller:controller(name)` | Sub-controller inheriting prefix, guards, interceptors, filters, metadata and version. |
+| `controller:use_prefix(prefix)` | This controller's path-prefix segment. |
+| `controller:version(v, ...)` | Serves its routes under `/v<v>` (several versions allowed; inherited; overridable per route). |
+| `controller:guard(...)` / `:intercept(...)` / `:filter(...)` / `:meta(k, v)` | As on modules, scoped to this controller and its children. |
 
-### RouteBuilder
+## Routes
 
 | Call | Description |
 |---|---|
-| `route:get/post/put/patch/delete(path)` | Registers an HTTP method + Nest-like path (`:param`, `*` wildcard) mapped to this route. You can call several of these on the same route to reuse one handler for multiple method/path pairs. |
-| `route:guard(...)` | Adds guards that run only for this route (after module- and controller-level guards). |
-| `route:intercept(...)` | Adds interceptors that wrap only this route's handler (innermost, after module/controller interceptors). |
-| `route:use_request()` | Adds the raw request table as the next handler argument. |
-| `route:use_response()` | Adds the mutable response table as the next handler argument (mutate `res.code`, `res.headers`, `res.body` directly). |
-| `route:use_param(name, pipe)` | Adds a `:name` path param as the next handler argument, run through `pipe` if given. |
-| `route:use_query(name, pipe)` | Adds a query-string value as the next argument. If `name` is `nil`, the whole query table is passed instead. |
-| `route:use_header(name, pipe)` | Adds an HTTP header value (case-insensitive lookup) as the next argument. |
-| `route:use_body(name, pipe)` | Adds a field of the request body (or the whole body if `name` is `nil`) as the next argument. |
-| `route:use_custom(selector)` | Adds `selector(ctx)`'s return value as the next argument — an escape hatch for anything not covered above. |
-| `route:handle(func)` | Sets the handler and completes the route builder. `func` receives exactly the arguments requested by the `use_*` calls above, **in the order they were called**. Returns the route builder. |
-| `route:describe()` | Introspection, see above. |
-| `route:<custom decorator>(...)` | Any decorator registered via `module:decorator` on the owning module. |
+| `route:get/post/put/patch/delete/head/options(path)` | Registers a method + path (see [paths](#paths)). Call several to reuse one handler. |
+| `route:all(path)` | Matches every method (a per-method route on the same path still wins). |
+| `route:status(code)` | Status code for successful responses (Nest's `@HttpCode`). |
+| `route:header(name, value)` | Response header (Nest's `@Header`). |
+| `route:version(v, ...)` | Overrides the controller's version. |
+| `route:meta(key, value)` | Route [metadata](#metadata). |
+| `route:doc{...}` | [OpenAPI](#openapi) documentation. |
+| `route:guard(...)` / `:intercept(...)` / `:filter(...)` | Innermost guards / interceptors / filters. |
+| `route:use_param(name, pipes...)` | `:name` path param. |
+| `route:use_query(name, pipes...)` | Query value. For a repeated key, the **last** value. `name == nil` gives the whole query table. |
+| `route:use_query_array(name, pipes...)` | Every value of a query key, always as an array. |
+| `route:use_header(name, pipes...)` | Header value (case-insensitive). |
+| `route:use_body(name, pipes...)` | A body field, or the whole body if `name` is `nil`. |
+| `route:use_file(name, pipes...)` | An uploaded file (from the multipart body parser). |
+| `route:use_inject(name)` | A provider instance. |
+| `route:use_request()` / `route:use_response()` | The raw request / the mutable response table. |
+| `route:use_custom(selector, pipes...)` | `selector(ctx)`'s return value. |
+| `route:handle(func)` | Sets the handler. It receives the `use_*` arguments **in the order they were declared**. |
 
-Argument order matters: whichever `use_*` you call first becomes the
-handler's first parameter, and so on.
-
-## HTTP exceptions
-
-Call one of these on the required module itself (not on `ctx` — the module
-returned by `require "nestlua"`) from inside a guard, interceptor,
-pipe, or handler to abort the request with that status code:
+A handler's return value becomes the response body. To set everything at once, return `nest.response{ code =, headers =, body = }`. For downloads and streams, see `nest.file(path, opts)` and `nest.stream(producer, opts)`:
 
 ```lua
-local nest = require "nestlua"
-
-controller:route("Example")
-  :get("/example")
-  :handle(function(body, res)
-    nest:not_implemented_error()
-  end)
-```
-
-This raises a Lua error carrying the exception; `module:handle()` catches
-it centrally (see "Exception filters" below) and turns it into the
-matching HTTP response — here, `{ code = 501, body = "Not Implemented" }`.
-
-| Method | Status |
-|---|---|
-| `nest:bad_request_error(message)` | 400 |
-| `nest:unauthorized_error(message)` | 401 |
-| `nest:forbidden_error(message)` | 403 |
-| `nest:not_found_error(message)` | 404 |
-| `nest:method_not_allowed_error(message)` | 405 |
-| `nest:not_acceptable_error(message)` | 406 |
-| `nest:request_timeout_error(message)` | 408 |
-| `nest:conflict_error(message)` | 409 |
-| `nest:gone_error(message)` | 410 |
-| `nest:precondition_failed_error(message)` | 412 |
-| `nest:payload_too_large_error(message)` | 413 |
-| `nest:unsupported_media_type_error(message)` | 415 |
-| `nest:im_a_teapot_error(message)` | 418 |
-| `nest:unprocessable_entity_error(message)` | 422 |
-| `nest:internal_server_error(message)` | 500 |
-| `nest:not_implemented_error(message)` | 501 |
-| `nest:bad_gateway_error(message)` | 502 |
-| `nest:service_unavailable_error(message)` | 503 |
-| `nest:gateway_timeout_error(message)` | 504 |
-| `nest:http_version_not_supported_error(message)` | 505 |
-| `nest:http_error(code, message)` | any code — the escape hatch, for statuses not covered above |
-
-This mirrors Nest's full built-in `HttpException` subclass list (from
-`@nestjs/common`). `message` is optional (each falls back to the standard
-status text, e.g. `"Not Implemented"`), can be a plain string, or can be a
-table for a structured error body:
-
-```lua
-nest:unprocessable_entity_error({ message = "Validation failed", errors = { "username too short" } })
--- -> response.body is that table, not a string
-```
-
-For advanced cases you can build (without throwing) an exception object
-with `nest.http_exception(code, message)` and check for one with
-`nest.is_http_exception(x)` — useful inside a filter that wants to
-re-throw a different exception, or construct one to return directly.
-
-Guards and interceptors can throw these too, not just handlers — a guard
-that calls `nest:forbidden_error("no token")` behaves the same as one that
-`return`s `false, "no token"` (both produce a 403), except throwing lets
-you attach it to any HTTP status, not just 403.
-
-## Exception filters
-
-Exception filters are registered exactly like guards and interceptors, at
-module, controller, or route scope:
-
-```lua
-module:filter(func)
-controller:filter(func)
-route:filter(func)
-```
-
-A filter is `function(exception, ctx) -> response table | nil`. `exception`
-is always an HttpException-shaped value — `{ code, body }`, plus `.cause`
-holding the original error when it wasn't raised via `nest:xxx_error()`
-(e.g. a genuine Lua bug gets normalized to a 500 with `.cause` set to the
-original error). Return a response table (`code`/`headers`/`body`, any
-field optional — omitted ones default from the exception) to handle it;
-return `nil` (or let the filter throw) to defer to the next, less specific
-filter, or to the built-in default response if none handle it.
-
-```lua
-module:filter(function(exception, ctx)
-  if exception.code == 404 then
-    return { code = 404, body = { error = "not_found", path = ctx.req.url } }
-  end
-  -- return nothing: let something else (a more general filter, or the
-  -- built-in default) handle anything that isn't a 404
+route:get("/report"):handle(function()
+  return nest.file("/srv/report.pdf", { content_type = "application/pdf", filename = "report.pdf" })
 end)
-```
-
-Filters are tried **most specific first**: route filters, then controller
-filters (leaf controller up through its ancestors), then module filters —
-the first one to return a response table wins. This mirrors Nest's filter
-scoping, where a method-level `@UseFilters()` takes priority over a
-controller- or app-level one. If every filter defers (or none are
-registered), the exception's own `code`/`body` become the response as-is.
-
-If a pipe already wrote a structured body onto `ctx.res` before signalling
-failure (see the pipes section above), that survives even through the
-default (no-filter) path — filters and the default handler both build on
-top of `ctx.res` rather than replacing it outright.
-
-`nest.compose_filters(...)` folds several filters into one callback (tries
-each in registered order, returns the first non-nil response) for the same
-reason `compose_guards`/`compose_interceptors` exist.
-
-## Guards
-
-A guard is `function(ctx) -> allowed[, reason]`. Guards run in this order
-for a request: module guards → controller guards (root to leaf, including
-sub-controllers) → route guards. The **first** guard to return a falsy
-value stops the chain and produces an HTTP `403` response (using `reason`
-as the body if provided). A guard can also throw one of the HTTP
-exceptions described below (e.g. `nest:forbidden_error(...)`, or any other
-status) for the same effect with more control over the status code; an
-unrelated Lua bug in a guard is caught and normalized to a `500` rather
-than crashing the request pipeline. Either way, exception filters (see
-below) get a chance to handle it before the default response goes out.
-
-```lua
-local function AuthGuard(ctx)
-  if ctx.req.headers["Authorization"] == "secret" then return true end
-  return false, "Unauthorized"
-end
-```
-
-You can fold several guards into one with `nest.compose_guards(...)` if
-that's cleaner or cheaper than registering them individually.
-
-## Interceptors
-
-An interceptor is `function(ctx, next) -> response`, where `next()` invokes
-the rest of the chain (further interceptors, then the handler) and returns
-its response. Interceptors compose module → controller → route, outermost
-first — mirroring Nest's execution model, so you can time, log, or
-transform the response around the actual handler call.
-
-```lua
-local function LoggingInterceptor(ctx, next)
-  local res = next()
-  print(ctx.req.method, ctx.req.url, res.code)
-  return res
-end
-```
-
-`nest.compose_interceptors(...)` folds several interceptors into a single
-callback for the same reason as `compose_guards`.
-
-## Pipes
-
-A pipe is `function(value, ctx) -> value2 | true | false`, passed to any
-`use_param` / `use_query` / `use_header` / `use_body` call:
-
-- returns `false` (or throws) → the request is rejected with `400`
-- returns `true` or `nil` → the original value is kept unchanged
-- returns anything else → that becomes the argument's value (i.e. it also
-  works as a transform, not just a validator)
-
-```lua
-local function sortValidator(value)
-  return value == nil or value == "ascending" or value == "descending"
-end
-
-local function toNumber(value)
-  return tonumber(value) -- transforms the string param into a number
-end
-```
-
-## Custom decorators
-
-`module:decorator(name, fn)` lets you package up common combinations of
-`use_*`/`guard`/`intercept` calls behind a single fluent method available on
-**both** controllers and routes belonging to that module:
-
-```lua
-module:decorator("use_paging", function(route)
-  return route
-    :use_query("pageIndex")
-    :use_query("pageLimit")
-end)
-
-controller:route("GetUsers")
-  :get("/users")
-  :use_paging()          -- expands to the two use_query calls above
-  :handle(function(pageIndex, pageLimit) ... end)
-```
-
-`fn` receives whatever it's called on (`route` or `controller`) as its
-first argument, followed by any extra arguments passed at the call site,
-and should generally return that same object so the fluent chain keeps
-working.
-
-## Context table
-
-Guards, interceptors and `use_custom` selectors all receive a `ctx` table:
-
-```lua
-{
-  req        = <request table>,
-  res        = <mutable response table>,
-  params     = { id = "42" },      -- resolved :param values for this match
-  query      = { sort = "asc" },   -- parsed query string
-  module     = <Module>,
-  controller = <Controller>,       -- the controller that owns the matched route
-  route      = <RouteBuilder>,     -- the matched route
-}
 ```
 
 ## Paths
 
-Paths follow Nest conventions:
+| Syntax | Matches |
+|---|---|
+| `/users` | literal segment |
+| `/:id` | one segment, captured into `ctx.params.id` (percent-decoded) |
+| `/:id(%d+)` | one segment matching the anchored **Lua pattern** |
+| `/:tab?` | optional segment (only trailing segments may be optional) |
+| `/*` or `/*path` | the rest of the path (must be last), in `ctx.params["*"]` and `ctx.params.path` |
 
-- literal segments match exactly (`/users`)
-- `:name` captures a single path segment into `ctx.params.name`
-- `*` as a whole segment greedily matches everything remaining and is
-  available as `ctx.params["*"]`
+Prefixes compose as module → imported modules → version → controllers → route.
 
-Prefixes compose from `module` → root controller → nested controllers →
-the route's own path, normalizing duplicate/missing slashes.
+**Routes are ranked by specificity, not registration order**: literal > constrained param > param > optional param > wildcard. So `/users/me` always beats `/users/:id`. Two routes with the same method and the same path shape (e.g. `/x/:id` and `/x/:name`) are reported as a duplicate at build time.
 
-Routes are tried in the order they were registered (depth-first through
-sub-controllers), and the first method+path match wins — so register more
-specific literal paths (e.g. `/users/me`) before more general parameterized
-ones (e.g. `/users/:id`) if they could otherwise collide.
+Automatic HTTP behaviour:
 
-## Introspection
+- the path matches but the method doesn't → **405** with an `Allow` header
+- `HEAD` falls back to the `GET` route (and the body is dropped)
+- `OPTIONS` without an explicit route → **204** with `Allow`
+- no match → **404**
 
-`module:describe()` / `controller:describe()` / `route:describe()` return
-plain nested Lua tables (names, prefixes, HTTP method+path pairs, ordered
-argument descriptors, guard/interceptor counts) with no functions inside,
-so they're trivial to `json.encode` for logging or to drive a future
-Swagger/OpenAPI generator.
+404 and 405 responses go through the module's middleware and exception filters, so a global error format applies to them too.
 
-## Type guards
+## Request lifecycle
 
-`nest.is_module(x)`, `nest.is_controller(x)`, `nest.is_route(x)`,
-`nest.is_app(x)` — useful inside decorator functions to assert what they
-were called on, exactly as shown in the design spec.
+```
+root-module middleware  →  routing  →  imported-module middleware  →  guards
+  →  interceptors (module → controller → route)  →  pipes  →  handler
+exceptions anywhere  →  filters (route → controllers → modules)  →  default response
+```
 
-## Files
+### Middleware
 
-- `src/core.lua` — the framework, single file, no external dependencies.
-- `src/scheme.lua` — the validator library described below.
-- `test/test_core.lua` / `test/test_exceptions.lua` / `test/test_scheme.lua` — self-contained
-  test suites. Run with `lua test-core.lua`, `lua test_exceptions.lua`, and
-  `lua test_scheme.lua`.
+`function(ctx, next) -> response`. Middleware on the module whose `handle()` is called runs **before routing** for every request, 404s included. It can modify `ctx.req`, short-circuit by returning its own response, or post-process what `next()` returns. Middleware on an imported module runs only for that module's routes, after routing.
+
+```lua
+local middleware = require "nestlua.middleware"
+
+app:use(
+  middleware.request_id(),                         -- ctx.request_id + X-Request-Id
+  middleware.cors({ origin = { "https://app.example" }, credentials = true }),
+  middleware.body_parser({ limit = 1024 * 1024 }), -- JSON / urlencoded / multipart
+  middleware.logger()                              -- "GET /users 200 1.2ms"
+)
+```
+
+`body_parser` decodes `application/json` (and `+json`), `application/x-www-form-urlencoded` and `multipart/form-data` string bodies. Uploaded files end up in `req.files[name] = { filename, content_type, data, size, headers }`, readable with `route:use_file(name)`. Malformed bodies get a 400, and bodies over `limit` a 413.
+
+`cors` options: `origin` (`"*"`, a string, a list or `function(origin)`), `methods`, `headers`, `expose`, `credentials`, `max_age`.
+
+### Guards
+
+`function(ctx) -> allowed[, reason]`. The first falsy result stops the request with **403** (`reason` as the body). A guard can also throw any HTTP exception.
+
+### Interceptors
+
+`function(ctx, next) -> response`. `next()` runs the rest of the chain. Composition is module → controller → route, outermost first.
+
+### Metadata
+
+`module/controller/route:meta(key, value)` attach metadata; `ctx:meta(key)` reads it with route > controller (leaf first) > module precedence. It's Nest's `SetMetadata` + `Reflector`:
+
+```lua
+local function RolesGuard(ctx)
+  local roles = ctx:meta("roles")
+  return not roles or roles[ctx.user.role], "forbidden"
+end
+
+controller:guard(RolesGuard)
+controller:route("Delete"):delete("/:id"):meta("roles", { admin = true }):handle(...)
+```
+
+### Pipes
+
+A pipe is any of:
+
+- a `function(value, ctx) -> result[, detail]`:
+  - `false` → 400. A table `detail` becomes the structured `errors` of the body; a string `detail` is appended to the message.
+  - `nil` / `true` → the value is unchanged
+  - anything else → the new value
+- a table with `:parse(value, ctx) -> ok, value_or_errors`. Scheme schemas and `nest.pipes.*` are this kind, and it can produce `false`/`nil` as values.
+
+Several pipes per argument run left to right. HTTP exceptions thrown by a pipe keep their status. Other errors become a 400 without leaking the error text.
+
+A validation failure from a schema produces:
+
+```json
+{ "message": "Validation failed", "source": "body", "errors": { "email": ["must be a valid email address"] } }
+```
+
+Built-in pipes (`nest.pipes`):
+
+| Pipe | Effect |
+|---|---|
+| `int` / `number` (`float`) / `bool` | Parse strings strictly (`"0x10"`, `"1e3"` for `int`, `"yes"` are rejected). |
+| `uuid` / `uuid(version)` | Validate a UUID. |
+| `enum(values...)` | Only the listed values. |
+| `default(v)` | Replace a missing value (a function is called for a fresh value). |
+| `optional(pipe)` | Let a missing value through as `nil`, otherwise apply `pipe`. |
+| `trim` | Trim whitespace. |
+| `array(item_pipe?, sep?)` | `"a,b"` → `{ "a", "b" }`, items piped. |
+| `chain(pipes...)` | Several pipes as one. |
+| `nest.pipe(fn, describe?)` | Build your own from `fn(value, ctx) -> ok, value_or_error`. |
+
+```lua
+route:get("/users"):use_query("limit", pipes.default("20"), pipes.int)
+```
+
+### Context
+
+Middleware, guards, interceptors, filters and `use_custom` receive `ctx`:
+
+```lua
+{
+  req, res,            -- request / mutable response
+  method, path,        -- normalized method and path
+  params, query,       -- path params, parsed query
+  root,                -- the module handle() was called on
+  module, controller,  -- owning module / controller of the matched route
+  route,
+  -- methods:
+  ctx:inject(name),    -- resolve a provider
+  ctx:meta(key),       -- read metadata
+}
+```
+
+## HTTP exceptions
+
+Call one on the required module (`nest:not_found_error()`) from any stage to abort the request with that status:
+
+| Method | Status |
+|---|---|
+| `bad_request_error` | 400 |
+| `unauthorized_error` | 401 |
+| `payment_required_error` | 402 |
+| `forbidden_error` | 403 |
+| `not_found_error` | 404 |
+| `method_not_allowed_error` | 405 |
+| `not_acceptable_error` | 406 |
+| `request_timeout_error` | 408 |
+| `conflict_error` | 409 |
+| `gone_error` | 410 |
+| `length_required_error` | 411 |
+| `precondition_failed_error` | 412 |
+| `payload_too_large_error` | 413 |
+| `uri_too_long_error` | 414 |
+| `unsupported_media_type_error` | 415 |
+| `range_not_satisfiable_error` | 416 |
+| `expectation_failed_error` | 417 |
+| `im_a_teapot_error` | 418 |
+| `misdirected_error` | 421 |
+| `unprocessable_entity_error` | 422 |
+| `locked_error` | 423 |
+| `precondition_required_error` | 428 |
+| `too_many_requests_error` | 429 |
+| `unavailable_for_legal_reasons_error` | 451 |
+| `internal_server_error` | 500 |
+| `not_implemented_error` | 501 |
+| `bad_gateway_error` | 502 |
+| `service_unavailable_error` | 503 |
+| `gateway_timeout_error` | 504 |
+| `http_version_not_supported_error` | 505 |
+| `http_error(code, message, headers)` | any code |
+
+Every helper takes `(message, headers)`. `message` is optional and defaults to the status text; it can be a string or a table (a structured body). `headers` are added to the default error response:
+
+```lua
+nest:too_many_requests_error("slow down", { ["Retry-After"] = "30" })
+nest:unprocessable_entity_error({ message = "Validation failed", errors = { "username too short" } })
+```
+
+`nest.http_exception(code, message, headers)` builds one without throwing, and `nest.is_http_exception(x)` checks for one. `nest.status_text[code]` maps codes to reason phrases.
+
+Any other error (a bug) becomes a **500 with a generic body**. The original error is kept as `exception.cause` (with `exception.traceback`) for filters, and is sent to the module logger. It never reaches the client unless `module:expose_errors(true)` is set.
+
+### Exception filters
+
+`function(exception, ctx) -> response | nil`, registered with `module/controller/route:filter(...)`. They're tried most specific first: route, then controllers (leaf to root), then modules. The first one to return a response wins. A filter that returns `nil` defers; one that errors is logged and skipped. If nothing handles the exception, its `code`/`body`/`headers` are applied on top of `ctx.res`.
+
+```lua
+app:filter(function(e, ctx)
+  return { code = e.code, body = { error = e.body, path = ctx.path, request_id = ctx.request_id } }
+end)
+```
+
+`nest.compose_guards(...)`, `nest.compose_interceptors(...)` (also `compose_middleware`) and `nest.compose_filters(...)` fold several into one.
+
+## Custom decorators
+
+`module:decorator(name, fn)` packages common `use_*`/`guard`/`meta` combinations behind one fluent method available on controllers and routes of that module:
+
+```lua
+app:decorator("use_paging", function(route)
+  return route
+    :use_query("page", pipes.default("1"), pipes.int)
+    :use_query("limit", pipes.default("20"), pipes.int)
+end)
+
+controller:route("List"):get("/"):use_paging():handle(function(page, limit) ... end)
+```
+
+## Async / coroutines
+
+Guards, interceptors, pipes and handlers may yield (e.g. cosockets inside a coroutine-based server). On Lua 5.2+ and LuaJIT this works natively. On PUC Lua 5.1, which cannot yield across `pcall`, NestLua runs user code in coroutines and forwards the yields itself.
 
 ---
 
@@ -371,103 +385,109 @@ were called on, exactly as shown in the design spec.
 
 ```lua
 local scheme = require "nestlua.scheme"
-```
 
-`scheme` builds reusable, chainable value/object validators, the same
-shape as class-validator's decorators but expressed as a fluent Lua API
-instead of annotations. A schema is just a callable value:
-
-```lua
-local ContactDtoValidator = scheme {
+local ContactDto = scheme {
   phone = scheme.string:phone(),
   email = scheme.string:email(),
 }
 
-local RegisterUserDtoValidator = scheme {
-  username = scheme.string:min(3):alpha(),
-  password = scheme.string:password(),
-  contact  = ContactDtoValidator:optional(),
-}
+local RegisterUserDto = scheme {
+  username         = scheme.string:trim():min(3):alpha(),
+  password         = scheme.string:strong_password(),
+  password_confirm = scheme.string:same_as("password"),
+  contact          = ContactDto:optional(),
+  newsletter       = scheme.boolean:default(false),
+}:strip()
 
-local isValid = RegisterUserDtoValidator({ username = "hello", password = "Example123*" })
--- isValid == true
-
-local ok, errors = RegisterUserDtoValidator({ username = "ab", password = "weak" })
--- ok == false
--- errors == { username = {"must be at least 3 characters long"},
---             password = {"must be at least 8 characters and include an ..."} }
+local ok, errors = RegisterUserDto(input)        -- validate
+local ok, value  = RegisterUserDto:parse(input)  -- validate + return the cleaned value
 ```
 
-Every schema returns `(ok, errors)` when called. `ok` is a plain boolean,
-so `local isValid = Validator(obj)` (capturing only the first return value)
-works exactly as in the design sample. `errors` is a plain nested Lua
-table with no functions in it — safe to log or `json.encode`:
+**Schemas are immutable.** Every chained call returns a new schema, so `ContactDto:optional()` above doesn't change `ContactDto`, and a base schema can be refined in several places safely.
 
-- a leaf schema (string/number/int/boolean/date) that fails returns an
-  **array of message strings**.
-- an object schema that fails returns a **map of `field -> errors`**,
-  recursively (nested objects nest naturally); a failed constraint on the
-  object itself (e.g. `:not_empty()`) is reported under the `_self` key.
-- an array/table schema with `:of(...)` returns a **map of
-  `index/key -> errors`** for whichever items didn't match, plus `_self`
-  for any array/table-level constraint failures (min/max/contains/etc).
+Calling a schema returns `(ok, errors)`. `:parse()` returns `(true, cleaned)` or `(false, errors)`, where the cleaned value has defaults filled in, coercions and transforms applied, and unknown fields stripped when `:strip()` is set. `errors` is plain data, safe to `json.encode`:
 
-## Scheme types
+- leaf schemas: an array of messages
+- objects: `field -> errors`, recursively; object-level failures under `_self` (`scheme.self_key`)
+- arrays / tables with `:of()`: `index/key -> errors`, plus `_self`
+
+`scheme.flatten(errors)` turns that into `{ { path = "contact.email", message = "..." }, ... }`.
+
+## Types
 
 | Type | Accepts |
 |---|---|
-| `scheme.string` | Lua strings |
-| `scheme.number` | any Lua number (int or float) |
-| `scheme.int` | a number with no fractional part |
+| `scheme.string` | strings |
+| `scheme.number` | finite numbers (NaN / ±inf rejected) |
+| `scheme.int` | finite numbers with no fractional part |
 | `scheme.boolean` | `true` / `false` |
-| `scheme.array` | a table that's a proper 1..n sequence with no holes |
-| `scheme.table` | any table (a general map/dictionary) |
-| `scheme.date` | a Lua date table `{year=,month=,day=,...}`, a unix timestamp number, or an ISO `"YYYY-MM-DD"` / `"YYYY-MM-DDTHH:MM:SS"` string |
-| `scheme { ... }` | calling `scheme` itself with a table of `field = schema` builds an **object** schema |
+| `scheme.array` | proper 1..n sequences |
+| `scheme.table` | any table (maps / dictionaries) |
+| `scheme.date` | a unix timestamp, a `{ year=, month=, day=, hour=, min=, sec= }` table, or ISO 8601 `"YYYY-MM-DD"` / `"YYYY-MM-DDTHH:MM[:SS[.fff]][Z\|±hh:mm]"`. Impossible dates (`2023-02-31`) are rejected; everything is UTC. |
+| `scheme { ... }` | an object with the given fields |
+| `scheme.any_of(a, b, ...)` | a value matching any of the schemas (first match wins) |
 
-## Common constraints (all types)
+## Modifiers (all types)
 
-`:optional()` `:empty()` `:not_empty()` `:is_in(values...)` `:not_in(values...)` `:equals(other)` `:not_equals(other)`
+| Modifier | Effect |
+|---|---|
+| `:optional()` | `nil` (and JSON null) is accepted |
+| `:nullable()` | JSON null (`scheme.null` / `json.null`) is accepted as a value |
+| `:default(v)` | `nil` becomes `v` (a function is called for a fresh value) |
+| `:coerce()` | strings are converted first: `"42"` → 42, `"true"`/`"1"` → true, `"a,b"` → `{ "a", "b" }` |
+| `:transform(fn)` | `fn(value)` runs after the type check, before rules |
+| `:message(msg)` | custom message for the previous rule (or the type check); a string or `function(args, value)` |
+| `:validate_if(fn)` | only validate when `fn(value, parent, root)` is truthy |
+| `:refine(fn, msg)` | custom rule `fn(value, vctx) -> ok[, msg]`; on objects it receives the whole object (cross-field rules) |
+| `:same_as(field)` | must equal a sibling field |
 
-`is_in`/`not_in` accept either varargs (`:is_in("a","b","c")`) or a single
-table of values (`:is_in({"a","b","c"})`). `equals`/`not_equals` deep-compare
-tables field by field.
+## Constraints
 
-## Number / int constraints
+**Common:** `:empty()` `:not_empty()` `:is_in(values...)` (alias `:enum`) `:not_in(values...)` `:equals(v)` `:not_equals(v)` (deep comparison)
 
-`:divisible_by(num)` `:positive()` `:negative()` `:min(num)` `:max(num)` `:range(min, max)`
+**number / int:** `:min(n)` `:max(n)` `:range(lo, hi)` `:positive()` `:negative()` `:divisible_by(n)`
 
-## Date constraints
+**date:** `:min(d)` `:max(d)` `:range(lo, hi)` `:to_timestamp()` (the cleaned value becomes a timestamp)
 
-`:min(date)` `:max(date)` `:range(min, max)` — bounds accept the same
-date-ish values described above (string/table/timestamp).
+**array:** `:of(schemas...)` `:min(n)` `:max(n)` `:range(lo, hi)` `:contains(v)` `:not_contains(v)` `:unique()`
 
-## Array / table constraints
+**table:** `:of(schemas...)` `:keys(schema)` `:min(n)` `:max(n)` `:range(lo, hi)` `:contains(v)` `:not_contains(v)`
 
-`:of(...)` (one or more schemas — an item is valid if it matches **any**
-one of them) `:min(n)` `:max(n)` `:range(min, max)` (item/entry count)
-`:contains(value)` `:not_contains(value)` `:not_empty()` (from the common set)
+**object:** `:strict()` (unknown fields are errors), `:strip()` (unknown fields dropped from the parsed value; recommended for request bodies), `:passthrough()` (default); composition with `:extend{...}` `:pick(names...)` `:omit(names...)` `:partial(names...?)` `:required()`
 
-`array` requires a proper sequence (`{1,2,3}`); `table` accepts any table,
-including maps (`{a=1,b=2}`), and iterates values via `pairs` for `:of()`
-and `:contains()`.
+**string:** lengths are counted in UTF-8 characters. `:min(n)` `:max(n)` `:range(lo, hi)`, transforms `:trim()` `:to_lower()` `:to_upper()`, and
+`:matches(lua_pattern)` `:starts_with(s)` `:ends_with(s)` `:contains(s)` `:not_contains(s)`
+`:alpha()` `:alphanumeric()` `:ascii()` `:lowercase()` `:uppercase()`
+`:boolean_string()` `:number_string()` `:date_string()` `:json()` `:jwt()`
+`:base32()` `:base64()` `:hexadecimal()` `:octal()`
+`:email()` `:url(opts)` `:uuid(version?)` `:phone()` `:ip_address("v4"|"v6"?)` `:mac_address()` `:port_number()`
+`:sem_ver()` `:strong_password()` (alias `:password()`) `:isbn()` `:credit_card()`
+`:passport_number()` `:postal_code()` `:ethereum_address()` `:btc_address()`
+`:hex_color()` `:hsl()` `:rgb()`
 
-## String constraints
+`:url{ protocols = { "http", "https" }, require_tld = true }`: by default only `http`, `https` and `ftp` are accepted; pass `protocols = "*"` for any scheme.
 
-`:boolean_string()` `:date_string()` `:number_string()` `:contains(seed)`
-`:not_contains(seed)` `:alpha()` `:alphanumeric()` `:ascii()` `:base32()`
-`:base64()` `:hexadecimal()` `:octal()` `:json()` `:jwt()` `:lowercase()`
-`:uppercase()` `:phone()` `:url()` `:min(n)` `:max(n)` `:range(min, max)`
-(string length) `:sem_ver()` `:strong_password()` / `:password()`
-`:mac_address()` `:ip_address(version)` (`version` is `"v4"`, `"v6"`, or
-omitted for either) `:port_number()` `:isbn()` `:credit_card()`
-`:passport_number()` `:postal_code()` `:ethereum_address()`
-`:btc_address()` `:email()` `:hex_color()` `:hsl()` `:rgb()`
+### What's a heuristic
+
+- **`phone()`**: optional `+`, then 7–15 digits after stripping spaces/dashes/dots/parens. Not full E.164.
+- **`passport_number()` / `postal_code()`**: generic shape checks; real formats vary per country.
+- **`ethereum_address()` / `btc_address()`**: format only. Checksums need Keccak-256 / double SHA-256.
+- **`jwt()`**: three base64url segments. The signature isn't verified.
+
+`isbn` and `credit_card` (Luhn) checksums, `json`, IPv4/IPv6 (including `::`, zone ids and embedded IPv4), dates and UUIDs are validated fully.
+
+## Messages and i18n
+
+Every message goes through `scheme.translate(key, default, args, value)` before it's reported. `key` is the rule name (`"min"`, `"email"`, ...), `"required"`, `"unknown"`, `"union"`, or `"type.<name>"`. Replace it to translate:
+
+```lua
+local messages = { required = "es obligatorio", email = "debe ser un correo válido" }
+scheme.translate = function(key, default) return messages[key] or default end
+```
 
 ## Custom types and constraints
 
 ```lua
--- new type, inheriting int's constraints (min/max/... still work on it)
 scheme:type("even_int", {
   extends = "int",
   check = function(v)
@@ -475,74 +495,145 @@ scheme:type("even_int", {
     return false, "must be an even integer"
   end,
 })
-scheme.even_int:min(2) -- usable immediately, chains like any built-in type
+scheme.even_int:min(2)
 
--- new constraint on an existing type
-scheme:constraint("string", "starts_with", function(value, prefix)
-  return value:sub(1, #prefix) == prefix
-end, "does not start with the required prefix")
-scheme.string:starts_with("Mr. ")
+-- fn(value, ...args, vctx): vctx.parent / vctx.root / vctx.path give context
+scheme:constraint("string", "not_reserved", function(value)
+  return value ~= "admin"
+end, "is reserved")
 
--- pass nil (or "any") as the type to register a constraint usable on every type
-scheme:constraint(nil, "not_sentinel", function(value) return value ~= 0 end)
+scheme:constraint(nil, "not_zero", function(v) return v ~= 0 end) -- every type
 ```
 
-`scheme:type(name, opts)`:
-- `opts.check(value) -> ok[, message]` — the type's core type-check (required
-  unless `opts.extends` is given and the base type already has one).
-- `opts.extends` — an existing type name whose constraint methods (and, if
-  `opts.check` is omitted, type-check) the new type inherits.
+## Schemas as pipes
 
-`scheme:constraint(type_name, constraint_name, fn, default_message)`:
-- `fn(value, ...) -> ok[, message]` — `...` are whatever extra arguments the
-  caller passes at the call site, e.g. `prefix` in `starts_with` above.
-- `type_name` is a built-in or custom type name, or `nil`/`"any"` to add the
-  constraint to every type (including future custom ones that don't
-  `extends` anything, since they all fall back to the shared base methods).
+A schema has `:parse()`, so it *is* a pipe. Passing one to `use_body` / `use_query` / `use_param` / ... replaces the argument with the cleaned value or rejects the request with a structured 400. Use `:coerce()` for query/path params, since those are always strings:
 
-## Pipes and introspection
+```lua
+route:get("/search"):use_query("page", scheme.int:coerce():min(1):default(1))
+```
 
-Every schema is directly usable as a NestLua route pipe (`route:use_body(nil,
-mySchema)` etc.) since pipes are just `function(value, ctx) -> ok|value|false`
-and a schema, called with one argument, returns exactly that. See
-`example_pipe_integration.lua` for a full example wiring a `scheme` object
-schema into `use_body()` with structured validation errors surfacing in the
-HTTP response body.
+`schema:describe()` returns a plain table (type, optional/nullable, rules **with their arguments**, nested shapes), which the OpenAPI generator uses.
 
-`schema:describe()` returns a plain-table introspection dump (type,
-whether it's optional, the ordered list of rule names, and recursively for
-nested `shape`/`item_schemas`) for the same future logging/Swagger use case
-as `nest`'s `describe()` methods.
+---
 
-## What's a heuristic, not a full spec implementation
+# OpenAPI
 
-A few constraints can't be fully implemented in pure Lua without extra
-dependencies, or don't have one universal standard to validate against.
-These are implemented as reasonable format-level checks, not omitted
-outright, but are worth knowing about:
+```lua
+local openapi = require "nestlua.openapi"
 
-- **`phone()`** — a generic "starts with optional `+`, 7–15 digits after
-  stripping spaces/dashes/parens" check, not full E.164/libphonenumber
-  validation (that needs a real phone-number metadata database).
-- **`passport_number()` / `postal_code()`** — generic shape checks (alnum,
-  plausible length). Real formats vary per issuing country; there's no
-  single standard, and country-aware validation would need a large rule
-  table or an external library.
-- **`ethereum_address()`** — checks `0x` + 40 hex characters only. Real
-  EIP-55 checksum validation needs a Keccak-256 hash, which isn't in the
-  Lua standard library.
-- **`btc_address()`** — checks the legacy/bech32 address *shape* only.
-  Real base58check validation needs a double SHA-256 hash, also not in the
-  stdlib.
-- **`jwt()`** — checks that the token has three well-formed base64url
-  segments. It intentionally does not (and cannot, without knowing the
-  signing algorithm/secret) verify the signature.
-- **`json()`** — this one *is* fully implemented: a small hand-written
-  recursive-descent parser validates JSON syntax without needing an
-  external JSON library.
+openapi.mount(app, "/openapi.json", { info = { title = "My API", version = "1.0.0" } })
+-- or: openapi.generate(app, opts) -> table, openapi.json(app, opts) -> string
+```
 
-Everything else in the requested constraint list (all the common/number/
-date/array/table constraints, and the rest of the string constraints
-including `email`, `url`, `credit_card` via Luhn, `isbn` via its real
-checksum, `ip_address` v4/v6, `mac_address`, `sem_ver`, `hex_color`,
-`hsl`, `rgb`, etc.) is fully implemented with no external dependencies.
+The document is built from the routes. It covers:
+* path/query/header parameters, with their pipe or schema types
+* request bodies from body schemas
+* multipart uploads from `use_file`
+* status codes from `route:status`
+* 400/403 responses when pipes/guards exist
+
+Add the rest with `route:doc{...}`:
+
+```lua
+route:doc({
+  summary = "Create a user",
+  description = "...",
+  tags = { "users" },          -- default: the root controller's name
+  operation_id = "createUser", -- default: the route name
+  deprecated = false,
+  security = { { bearer = {} } },
+  responses = { [201] = { description = "Created", schema = UserDto } },
+})
+```
+
+Lua patterns aren't regexes, so `:matches()` and `:id(%d+)` constraints are emitted as `x-lua-pattern`. Optional path params are expanded into one path per variant. Routes with `:meta("openapi_exclude", true)` are left out (the mounted document route is, automatically).
+
+---
+
+# HTTP server (lua-mhd)
+
+`nestlua.mhd` serves an app with GNU libmicrohttpd through [lua-mhd](https://github.com/pjjov/lua-mhd) (`luarocks install lua-mhd`; lua-mhd 2.1 or newer, Lua 5.2+).
+
+lua-mhd handles every request on a worker thread with its own `lua_State`, so the app is loaded **once per worker**. Put it in a module or file that returns a Module, an App, or a `function(...)` returning one:
+
+```lua
+local adapter = require "nestlua.mhd"
+
+local srv = adapter.listen({
+  port = 8080,
+  thread_pool_size = 4,
+  max_body_size = 10 * 1024 * 1024,
+  -- adapter options:
+  nest = { body_parser = { limit = 10 * 1024 * 1024 } },
+}, "app", "extra", "args")   -- "app" or "./app.lua"; extra args go to the app function
+
+io.read("l")
+srv:stop()
+```
+
+All other `options` are passed to lua-mhd (TLS, Unix sockets, connection limits, ...). Extra arguments may be `nil`, booleans, numbers or strings. Workers inherit the launching process's `package.path` / `package.cpath`.
+
+The adapter:
+
+- maps lua-mhd's request table onto NestLua's. lua-mhd's parsed `query` is reused (lua-mhd keeps only the last value of a repeated key), and `basic_auth`, `digest_username` and `check_digest` are passed through.
+- installs `middleware.body_parser()` in front of the app (`nest = { body_parser = false }` to disable it)
+- encodes table bodies as JSON and sets `Content-Type`
+- stringifies header values (lua-mhd silently drops non-string ones) and joins list values with `", "`
+- passes `file`, `stream`, `stream_size` and `digest_challenge` through, so `nest.file()` / `nest.stream()` work
+
+If you write your own lua-mhd worker script, use the handler directly:
+
+```lua
+return require("nestlua.mhd").handler(require("app"))
+```
+
+Workers don't share memory, so in-process state (caches, in-memory stores, provider singletons) is per worker. Keep shared state in a database or another external service.
+
+---
+
+# Development
+
+```sh
+lua test/run.lua            # every suite, against ./src (never an installed rock)
+lua test/run.lua routing    # one suite
+luacheck src test examples
+luarocks make               # install from the working tree
+```
+
+CI runs the suites on Lua 5.1–5.4 and LuaJIT, plus luacheck.
+
+## Source layout
+
+Each public module is a thin entry point over smaller files that can also be required directly:
+
+```
+src/nestlua/
+  init.lua              public API (require "nestlua")
+  module.lua            Module class: registration, lifecycle, logging
+  providers.lua         dependency injection (mixed into Module)
+  controller.lua        Controller builder
+  route.lua             RouteBuilder
+  router/init.lua       build(): route table compilation (mixed into Module)
+  router/pattern.lua    path pattern syntax, matching, ranking
+  router/dispatch.lua   handle(): the request pipeline (mixed into Module)
+  router/args.lua       handler argument resolution
+  pipes.lua             pipe protocol and nest.pipes
+  http.lua              status texts, exceptions, headers
+  response.lua          nest.response / file / stream
+  compose.lua           guard / interceptor / filter composition
+  try.lua               coroutine-safe protected calls
+  url.lua, util.lua     helpers
+  json.lua              JSON encoder / decoder
+  scheme/               the validator
+    init.lua              public API, scheme:type / scheme:constraint
+    schema.lua            schema objects, modifiers, validation core
+    types/                common, scalar, string, collection, object, union
+    validators/           text, network, identifiers (pure string predicates)
+    dates.lua, errors.lua, config.lua, util.lua
+  middleware/           body_parser, multipart, cors, request_id, logger
+  openapi/              schema (describe -> JSON Schema), paths, operation
+  mhd/                  lua-mhd adapter (init) and request/response conversion
+test/                   test suites (test/run.lua runs them all)
+examples/               a runnable lua-mhd example app
+```
