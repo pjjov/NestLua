@@ -6,7 +6,7 @@
 --
 -- Look at the LICENSE file for more information.
 
-package.path = "./?.lua;./?/init.lua;" .. package.path
+package.path = "./src/?.lua;./src/?/init.lua;" .. package.path
 local scheme = require "nestlua.scheme"
 
 local failures = 0
@@ -136,8 +136,6 @@ check("table of(number) rejects non-number value", not tblOf({ a = 1, b = "x" })
 --=====================================================--
 -- string constraints (spot-check the whole surface)
 --=====================================================--
-
-local function s(v) return v end -- readability helper only
 
 check("alpha accepts letters", (scheme.string:alpha())("HelloWorld"))
 check("alpha rejects digits", not (scheme.string:alpha())("Hello1"))
