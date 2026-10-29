@@ -6,7 +6,7 @@
 --
 -- Look at the LICENSE file for more information.
 
-package.path = "./?.lua;./?/init.lua;" .. package.path
+package.path = "./src/?.lua;./src/?/init.lua;" .. package.path
 local nest = require "nestlua"
 
 local failures = 0

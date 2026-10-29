@@ -6,7 +6,7 @@
 --
 -- Look at the LICENSE file for more information.
 
-package.path = "./?.lua;./?/init.lua;" .. package.path
+package.path = "./src/?.lua;./src/?/init.lua;" .. package.path
 local nest = require "nestlua"
 
 local failures = 0
@@ -63,9 +63,9 @@ getUsers
       return { sort = sort, pageIndex = pageIndex, pageLimit = pageLimit }
     end)
 
--- route using use_custom (registered before the ":id" route below so that
--- the more specific literal "/me" segment is matched first -- routes are
--- tried in registration order, just like Express/Nest route ordering)
+-- route using use_custom ("/me" is a literal segment, so it is matched
+-- before the ":id" route below regardless of registration order --
+-- routes are ranked by specificity)
 local whoAmI = users:route("WhoAmI")
 whoAmI
     :get("/me")
